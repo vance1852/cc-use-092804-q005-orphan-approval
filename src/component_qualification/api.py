@@ -6,6 +6,7 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .errors import ServiceError
 from .service import ComponentService
 
 
@@ -20,35 +21,56 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _error(self, exc: Exception) -> None:
+        if isinstance(exc, PermissionError):
+            status, code = 403, "forbidden"
+        elif isinstance(exc, ServiceError):
+            status, code = exc.status, exc.code
+        else:
+            status, code = 400, "invalid_request"
+        self._json(status, {"error": {"code": code, "message": str(exc)}})
+
+    def _token(self) -> str:
+        return self.headers.get("Authorization", "").removeprefix("Bearer ")
+
     def do_GET(self):
         if self.path == "/health":
             return self._json(200, {"status": "ok", "service": "component-qualification"})
-        if self.path.startswith("/lots/"):
-            try:
-                token = self.headers.get("Authorization", "").removeprefix("Bearer ")
-                return self._json(200, self.service.get_lot(token, self.path.split("/", 2)[2]))
-            except Exception as exc:
-                return self._json(400, {"error": str(exc)})
-        return self._json(404, {"error": "not found"})
+        parts = self.path.strip("/").split("/")
+        try:
+            with self.service.gate:
+                if len(parts) == 2 and parts[0] == "lots":
+                    return self._json(200, self.service.get_lot(self._token(), parts[1]))
+                if len(parts) == 3 and parts[0] == "lots" and parts[2] == "audit":
+                    return self._json(200, {"events": self.service.audit(self._token(), parts[1])})
+            return self._json(404, {"error": {"code": "route_not_found", "message": "not found"}})
+        except Exception as exc:
+            return self._error(exc)
 
     def do_POST(self):
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
             if self.path == "/login":
                 return self._json(200, {"token": self.service.auth.login(body["user_id"], body["password"])})
-            token = self.headers.get("Authorization", "").removeprefix("Bearer ")
-            if self.path == "/lots":
-                return self._json(201, self.service.create_lot(token, body["lot_id"], body["product"], body["process_rev"], body["unit_count"]))
-            if self.path.startswith("/lots/") and self.path.endswith("/measurements"):
-                lot_id = self.path.split("/")[2]
-                return self._json(201, self.service.add_measurement(token, lot_id, body["signal_frequency_hz"], body["response"], body.get("noise", 0.0), body["instrument"]))
-            if self.path.startswith("/lots/") and self.path.endswith("/analysis"):
-                return self._json(200, self.service.analyze(token, self.path.split("/")[2]))
-            return self._json(404, {"error": "not found"})
-        except PermissionError as exc:
-            return self._json(403, {"error": str(exc)})
+            token = self._token()
+            parts = self.path.strip("/").split("/")
+            with self.service.gate:
+                if self.path == "/lots":
+                    return self._json(201, self.service.create_lot(token, body["lot_id"], body["product"], body["process_rev"], body["unit_count"]))
+                if len(parts) == 3 and parts[0] == "lots" and parts[2] == "measurements":
+                    return self._json(201, self.service.add_measurement(token, parts[1], body["signal_frequency_hz"], body["response"], body.get("noise", 0.0), body["instrument"]))
+                if len(parts) == 3 and parts[0] == "lots" and parts[2] == "analysis":
+                    return self._json(200, self.service.analyze(token, parts[1]))
+                if len(parts) == 3 and parts[0] == "lots" and parts[2] == "approvals":
+                    return self._json(200, self.service.approve(
+                        token, parts[1], body["decision"], body["reason"],
+                        body.get("expected_revision"),
+                    ))
+            return self._json(404, {"error": {"code": "route_not_found", "message": "not found"}})
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            return self._json(422, {"error": {"code": "validation_failed", "message": str(exc)}})
         except Exception as exc:
-            return self._json(400, {"error": str(exc)})
+            return self._error(exc)
 
 
 def main() -> None:
@@ -57,7 +79,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
-    Handler.service = ComponentService(args.database)
+    Handler.service = ComponentService(args.database, cross_thread=True)
     Handler.service.bootstrap_admin()
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
